@@ -15,8 +15,7 @@ text_chunks = []
 metadatas = []
 
 
-# Chunk the text
-
+# Define text splitter
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=500,
     chunk_overlap=100,
@@ -24,7 +23,7 @@ splitter = RecursiveCharacterTextSplitter(
 )
 
 
-# Iterate through each page in the PDF
+
 for i, page in enumerate(doc):
     page_text = page.get_text()
     chunks = splitter.split_text(page_text)
