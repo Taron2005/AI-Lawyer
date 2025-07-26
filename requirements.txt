@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+openai
+sentence-transformers
+faiss-cpu
+python-multipart  # Needed for file uploads
+PyMuPDF            # For reading PDFs (optional for now)
+langchain
+fitz
+streamlit
