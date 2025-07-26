@@ -24,6 +24,7 @@ splitter = RecursiveCharacterTextSplitter(
 )
 
 
+# Iterate through each page in the PDF
 for i, page in enumerate(doc):
     page_text = page.get_text()
     chunks = splitter.split_text(page_text)
