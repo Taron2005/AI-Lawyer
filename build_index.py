@@ -5,7 +5,7 @@ import faiss  # Facebook AI Similarity Search - efficient vector search library.
 from sentence_transformers import SentenceTransformer  # To create embeddings.
 from langchain.text_splitter import RecursiveCharacterTextSplitter  # Smart chunking.
 
-print('Building FAISS index...')
+
 
 model = SentenceTransformer("all-MiniLM-L6-v2")  # small & fast
 
@@ -15,13 +15,13 @@ text_chunks = []
 metadatas = []
 
 
-# Define text splitter
+# Chunk the text
+
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=500,
     chunk_overlap=100,
     separators=["\n\n", "\n", ".", " "]
 )
-
 
 
 for i, page in enumerate(doc):
