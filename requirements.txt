@@ -8,3 +8,4 @@ PyMuPDF            # For reading PDFs (optional for now)
 langchain
 fitz
 streamlit
+python-dotenv

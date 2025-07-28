@@ -1,53 +1,63 @@
 import fitz  # PyMuPDF: For reading PDF files.
-import os     # (Not used here, but often useful for path operations)
-import pickle # For serializing and saving data.
-import faiss  # Facebook AI Similarity Search - efficient vector search library.
-from sentence_transformers import SentenceTransformer  # To create embeddings.
-from langchain.text_splitter import RecursiveCharacterTextSplitter  # Smart chunking.
+import os
+import pickle
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
+# Constants
+PDF_PATH = "docs/constitution.pdf"
+INDEX_PATH = "storage/faiss_index.bin"
+METADATA_PATH = "storage/index_metadata.pkl"
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 100
 
-
-model = SentenceTransformer("all-MiniLM-L6-v2")  # small & fast
+# Load embedding model
+model = SentenceTransformer(EMBEDDING_MODEL_NAME)
 
 # Load PDF
-doc = fitz.open("docs/constitution.pdf")
+doc = fitz.open(PDF_PATH)
+
+# Initialize containers
 text_chunks = []
 metadatas = []
 
-
-# Chunk the text
-
+# Splitter config
 splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=100,
+    chunk_size=CHUNK_SIZE,
+    chunk_overlap=CHUNK_OVERLAP,
     separators=["\n\n", "\n", ".", " "]
 )
 
-
+# Extract & chunk PDF
 for i, page in enumerate(doc):
     page_text = page.get_text()
-    chunks = splitter.split_text(page_text)
+    if not page_text.strip():
+        continue  # Skip empty pages
 
+    chunks = splitter.split_text(page_text)
     for j, chunk in enumerate(chunks):
         text_chunks.append(chunk)
         metadatas.append({
             "page": i + 1,
             "chunk_id": j,
-            "source": "constitution.pdf"
+            "source": os.path.basename(PDF_PATH)
         })
 
-embeddings = model.encode(text_chunks)
+# Embed text
+embeddings = model.encode(text_chunks, show_progress_bar=True, convert_to_numpy=True)
 
 # Build FAISS index
 index = faiss.IndexFlatL2(embeddings.shape[1])
-index.add(embeddings)
+index.add(np.array(embeddings))
 
-# Save index
-faiss.write_index(index, "storage/faiss_index.bin")
+# Save index and metadata
+os.makedirs("storage", exist_ok=True)
+faiss.write_index(index, INDEX_PATH)
 
-
-# Save text chunks & metadata
-with open("storage/index_metadata.pkl", "wb") as f:
+with open(METADATA_PATH, "wb") as f:
     pickle.dump({"texts": text_chunks, "metadatas": metadatas}, f)
 
-print("FAISS index and metadata saved.")
+print("✅ FAISS index and metadata saved.")
