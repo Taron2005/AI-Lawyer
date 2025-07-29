@@ -4,6 +4,8 @@ from rag import RAGEngine
 from llm import generate_response
 import fitz
 import logging
+from fastapi.responses import FileResponse
+
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
@@ -23,11 +25,18 @@ async def ask(request: QuestionRequest):
         retrieved = rag.retrieve(request.question.strip(), k=3)
         context = [item["text"] for item in retrieved]
         answer = generate_response(request.question.strip(), context)
+        
+        # --- TTS: Convert answer to speech and save ---
+        tts_filename = "answer.wav"
+        foo(answer, filename=tts_filename)
+
         return {
             "answer": answer,
+            "audio_file": tts_filename,
             "sources": [item["metadata"] for item in retrieved],
             "snippets": context
         }
+
     except Exception as e:
         logger.exception("RAG retrieval failed.")
         raise HTTPException(status_code=500, detail=f"Internal error: {e}")
@@ -69,3 +78,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         "new_chunks": after - before,
         "total_chunks": after
     }
+
+@app.get("/audio")
+async def get_audio():
+    return FileResponse("answer.wav", media_type="audio/wav", filename="answer.wav")

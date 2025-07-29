@@ -2,8 +2,24 @@ import streamlit as st
 from rag import RAGEngine
 from llm import generate_response
 import fitz  # PyMuPDF
+from speech_api import tts_long_text
+from pathlib import Path
+
+
+def delete_audio_files():
+    for file_path in st.session_state.audio_files:
+        try:
+            os.remove(file_path)
+        except Exception as e:
+            print(f"Error deleting {file_path}: {e}")
+    st.session_state.audio_files = []
+
 
 rag = RAGEngine()
+
+if "audio_files" not in st.session_state:
+    st.session_state.audio_files = []
+
 
 st.set_page_config(page_title="AI Legal Assistant", layout="wide")
 st.title("📄 AI Legal Assistant")
@@ -60,6 +76,7 @@ st.header("🔍 Ask a Legal Question")
 query = st.text_input("Enter your legal question:")
 
 if query:
+    delete_audio_files()
     with st.spinner("Retrieving relevant legal context..."):
         results = rag.retrieve(query, k=5)
         context_chunks = [r["text"] for r in results]
@@ -73,12 +90,13 @@ if query:
 
     with st.spinner("Generating answer..."):
         answer = generate_response(query, context_chunks)
+        success, audio_files_or_error = tts_long_text(answer, base_filename="answer")
 
     st.subheader("🤖 AI Answer")
 
     if context_chunks:
         avg_score = sum(r["score"] for r in results) / len(results)
-        threshold_score = 0.3  # Tune this threshold based on your setup
+        threshold_score = 0.3
 
         if avg_score >= threshold_score:
             st.markdown("📄 **Answer based on uploaded legal documents:**")
@@ -93,6 +111,15 @@ if query:
 
     st.write(answer)
 
+    if success:
+        # Play each audio chunk in order
+        for audio_path in audio_files_or_error:
+            with open(audio_path, "rb") as f:
+                audio_bytes = f.read()
+            st.audio(audio_bytes, format="audio/wav")
+    else:
+        st.error(audio_files_or_error)
+
 # --- Delete Files Section ---
 st.sidebar.header("🗑️ Manage Indexed Files")
 file_sources = list({meta["source"] for meta in rag.metadatas})
@@ -104,4 +131,4 @@ else:
     if st.sidebar.button("Delete File"):
         rag.delete_by_source(to_delete)
         st.sidebar.success(f"Deleted all chunks from '{to_delete}'")
-        st.rerun()
+        st.experimental_rerun()
