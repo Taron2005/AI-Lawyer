@@ -1,63 +1,52 @@
-import fitz  # PyMuPDF: For reading PDF files.
 import os
-import pickle
-import faiss
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+import fitz  # PyMuPDF
+from rag import KnowledgeGraph
+from llm import extract_triples_from_text
 
-# Constants
-PDF_PATH = "docs/constitution.pdf"
-INDEX_PATH = "storage/faiss_index.bin"
-METADATA_PATH = "storage/index_metadata.pkl"
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 100
+# --- Config ---
+PDF_PATH     = "docs/constitution.pdf"
+CHUNK_MINLEN = 5   # skip tiny paragraphs
 
-# Load embedding model
-model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-
-# Load PDF
-doc = fitz.open(PDF_PATH)
-
-# Initialize containers
-text_chunks = []
-metadatas = []
-
-# Splitter config
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=CHUNK_SIZE,
-    chunk_overlap=CHUNK_OVERLAP,
-    separators=["\n\n", "\n", ".", " "]
-)
-
-# Extract & chunk PDF
-for i, page in enumerate(doc):
-    page_text = page.get_text()
-    if not page_text.strip():
-        continue  # Skip empty pages
-
-    chunks = splitter.split_text(page_text)
-    for j, chunk in enumerate(chunks):
-        text_chunks.append(chunk)
-        metadatas.append({
-            "page": i + 1,
-            "chunk_id": j,
-            "source": os.path.basename(PDF_PATH)
-        })
-
-# Embed text
-embeddings = model.encode(text_chunks, show_progress_bar=True, convert_to_numpy=True)
-
-# Build FAISS index
-index = faiss.IndexFlatL2(embeddings.shape[1])
-index.add(np.array(embeddings))
-
-# Save index and metadata
 os.makedirs("storage", exist_ok=True)
-faiss.write_index(index, INDEX_PATH)
 
-with open(METADATA_PATH, "wb") as f:
-    pickle.dump({"texts": text_chunks, "metadatas": metadatas}, f)
+kg = KnowledgeGraph()
+doc = fitz.open(PDF_PATH)
+base_name = os.path.basename(PDF_PATH)
 
-print("✅ FAISS index and metadata saved.")
+for page_num, page in enumerate(doc, start=1):
+    text = page.get_text("text").strip()
+    if not text:
+        continue
+
+    paras = [p.strip() for p in text.split("\n\n") if len(p.strip()) >= CHUNK_MINLEN]
+
+    for idx, para in enumerate(paras):
+        para_id = f"{base_name}_p{page_num}_{idx}"
+        
+        # Extract triples from this paragraph
+        triples = extract_triples_from_text(para)
+        
+        if not triples:
+            # fallback to store paragraph as-is if no triples found
+            kg.add_fact(
+                subject=para_id,
+                relation="has_paragraph",
+                obj=para,
+                source=base_name
+            )
+            continue
+
+        for triple in triples:
+            kg.add_fact(
+                subject=triple["subject"],
+                relation=triple["relation"],
+                obj=triple["object"],
+                source=f"{base_name}_p{page_num}"
+            )
+
+# Detect communities (Leiden)
+kg.detect_communities()
+
+# Save graph
+kg.persist()
+print("✅ Knowledge graph build complete.")

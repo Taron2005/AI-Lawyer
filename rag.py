@@ -1,140 +1,86 @@
 import os
-import faiss
 import pickle
 import logging
+import networkx as nx
 import numpy as np
-from datetime import datetime
-from typing import List, Dict, Tuple, Optional
 from sentence_transformers import SentenceTransformer
+from typing import List, Dict
+import igraph as ig
+import leidenalg
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
+GRAPH_PATH = "storage/kg_graph.pkl"
 
-class RAGEngine:
-    def __init__(
-        self,
-        index_path: str = "storage/faiss_index.bin",
-        metadata_path: str = "storage/index_metadata.pkl",
-        model_name: str = "all-MiniLM-L6-v2"
-    ):
-        self.index_path = index_path
-        self.metadata_path = metadata_path
-        self.model = SentenceTransformer(model_name)
+class KnowledgeGraph:
+    def __init__(self):
+        self.graph = nx.DiGraph()
+        self.model = SentenceTransformer("all-MiniLM-L6-v2")
 
-        self.index = self._load_faiss_index()
-        self.texts, self.metadatas = self._load_metadata()
+        if os.path.exists(GRAPH_PATH):
+            try:
+                with open(GRAPH_PATH, "rb") as f:
+                    self.graph = pickle.load(f)
+                logger.info(f"Loaded existing KG from {GRAPH_PATH}")
+            except Exception as e:
+                logger.warning(f"Could not load KG pickle: {e}. Starting fresh.")
+        else:
+            logger.info("No existing KG found; starting with an empty graph.")
 
-    def _load_faiss_index(self) -> faiss.Index:
-        if not os.path.exists(self.index_path):
-            logger.warning("FAISS index not found, creating a new one.")
-            return faiss.IndexFlatIP(self.model.get_sentence_embedding_dimension())
-        try:
-            return faiss.read_index(self.index_path)
-        except Exception as e:
-            logger.error(f"Failed to load FAISS index: {e}")
-            raise
+    def add_fact(self, subject: str, relation: str, obj: str, source: str = None):
+        self.graph.add_edge(subject, obj, relation=relation, source=source)
+        logger.info(f"Added triple: ({subject}) -[{relation}]-> ({obj})")
 
-    def _load_metadata(self) -> Tuple[List[str], List[Dict]]:
-        if not os.path.exists(self.metadata_path):
-            logger.warning("Metadata file not found. Initializing empty metadata.")
-            return [], []
-        try:
-            with open(self.metadata_path, "rb") as f:
-                data = pickle.load(f)
-            return data.get("texts", []), data.get("metadatas", [])
-        except Exception as e:
-            logger.error(f"Failed to load metadata: {e}")
-            raise
+        for node in [subject, obj]:
+            if "embedding" not in self.graph.nodes[node]:
+                self.graph.nodes[node]["embedding"] = self.model.encode(node)
 
-    def _normalize(self, vecs: np.ndarray) -> np.ndarray:
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        return vecs / np.maximum(norms, 1e-10)
+    def query(self, keyword: str, k: int = 5) -> List[Dict]:
+        nodes = [n for n in self.graph.nodes if "embedding" in self.graph.nodes[n]]
+        if not nodes:
+            logger.warning("KG has no embedded nodes.")
+            return []
 
-    def _encode(self, texts: List[str]) -> np.ndarray:
-        try:
-            with torch.no_grad():
-                embeddings = self.model.encode(texts, convert_to_numpy=True)
-        except Exception:
-            embeddings = self.model.encode(texts)
-        return self._normalize(np.array(embeddings, dtype=np.float32))
+        node_embs = np.array([self.graph.nodes[n]["embedding"] for n in nodes])
+        q_emb = self.model.encode([keyword])[0]
 
-    def retrieve(self, query: str, k: int = 5) -> List[Dict]:
-        if not query.strip():
-            raise ValueError("Query string is empty.")
+        node_embs = node_embs / np.linalg.norm(node_embs, axis=1, keepdims=True)
+        q_emb = q_emb / np.linalg.norm(q_emb)
+        scores = node_embs @ q_emb
 
-        embedding = self._encode([query])
-        D, I = self.index.search(embedding, k)
-
+        top_idxs = np.argsort(scores)[-k:][::-1]
         results = []
-        for dist, idx in zip(D[0], I[0]):
-            if idx < len(self.texts):
+
+        for idx in top_idxs:
+            node = nodes[idx]
+            for nbr in self.graph.successors(node):
+                ed = self.graph.get_edge_data(node, nbr)
                 results.append({
-                    "text": self.texts[idx],
-                    "metadata": self.metadatas[idx],
-                    "score": float(dist)
+                    "subject": node,
+                    "relation": ed["relation"],
+                    "object": nbr,
+                    "source": ed.get("source", "Unknown"),
+                    "score": float(scores[idx])
                 })
         return results
 
-    def add_to_index(self, file_name: str, file_chunks: List[str]) -> None:
-        if not file_chunks:
-            logger.warning("No file chunks provided.")
-            return
+    def detect_communities(self):
+        logger.info("Detecting communities using Leiden algorithm...")
+        undirected = self.graph.to_undirected()
+        ig_graph = ig.Graph.TupleList(undirected.edges(), directed=False)
 
-        new_chunks, new_metadatas = [], []
-        existing_text_set = set(self.texts)
+        partition = leidenalg.find_partition(ig_graph, leidenalg.ModularityVertexPartition)
+        for community_id, community in enumerate(partition):
+            for ig_node in community:
+                node_name = ig_graph.vs[ig_node]["name"]
+                if node_name in self.graph.nodes:
+                    self.graph.nodes[node_name]["community"] = community_id
 
-        for chunk in file_chunks:
-            if chunk not in existing_text_set:
-                new_chunks.append(chunk)
-                new_metadatas.append({
-                    "source": file_name,
-                    "added_at": datetime.utcnow().isoformat()
-                })
+        logger.info(f"Assigned {len(partition)} communities to graph nodes.")
 
-        if not new_chunks:
-            logger.info("No new unique chunks to add.")
-            return
-
-        new_embeddings = self._encode(new_chunks)
-        self.index.add(new_embeddings)
-        self.texts.extend(new_chunks)
-        self.metadatas.extend(new_metadatas)
-
-        self._persist()
-        logger.info(f"Added {len(new_chunks)} new chunks from '{file_name}'.")
-
-    def delete_by_source(self, file_name: str) -> None:
-        logger.info(f"Deleting all entries from source: '{file_name}'")
-
-        kept_texts, kept_metadatas = [], []
-        for text, meta in zip(self.texts, self.metadatas):
-            if meta.get("source") != file_name:
-                kept_texts.append(text)
-                kept_metadatas.append(meta)
-
-        if len(kept_texts) == len(self.texts):
-            logger.warning("No entries found for deletion.")
-            return
-
-        self.texts, self.metadatas = kept_texts, kept_metadatas
-
-        if kept_texts:
-            embeddings = self._encode(kept_texts)
-            self.index = faiss.IndexFlatIP(self.model.get_sentence_embedding_dimension())
-            self.index.add(embeddings)
-        else:
-            self.index = faiss.IndexFlatIP(self.model.get_sentence_embedding_dimension())
-
-        self._persist()
-        logger.info(f"Deleted source '{file_name}'. Rebuilt index with {len(self.texts)} entries.")
-
-    def _persist(self) -> None:
-        try:
-            faiss.write_index(self.index, self.index_path)
-            with open(self.metadata_path, "wb") as f:
-                pickle.dump({"texts": self.texts, "metadatas": self.metadatas}, f)
-            logger.info("Index and metadata saved.")
-        except Exception as e:
-            logger.error(f"Failed to persist data: {e}")
-            raise
+    def persist(self):
+        os.makedirs(os.path.dirname(GRAPH_PATH), exist_ok=True)
+        with open(GRAPH_PATH, "wb") as f:
+            pickle.dump(self.graph, f)
+        logger.info(f"KG persisted to {GRAPH_PATH}")
