@@ -1,11 +1,31 @@
-fastapi
-uvicorn
+# Core LLM & API
+groq
 openai
+
+# PDF processing
+PyMuPDF
+
+# Embedding model
 sentence-transformers
+torch
+
+# Graph + vector search
+networkx
+leidenalg
 faiss-cpu
-python-multipart  # Needed for file uploads
-PyMuPDF            # For reading PDFs (optional for now)
-langchain
-fitz
-streamlit
+
+# Graph tools
+igraph
+
+# Env variables
 python-dotenv
+
+# Frontend
+streamlit
+
+# Audio output
+gTTS
+
+# Other utilities
+scikit-learn
+tqdm
