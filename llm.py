@@ -1,93 +1,176 @@
 import os
-import requests
-import logging
-import time
+import re
 from dotenv import load_dotenv
+from groq import Groq
+from typing import List, Optional, Dict
 
+# --- Initialization ---
 load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-logger = logging.getLogger(__name__)
+# --- Model Configuration ---
+LLM_MODEL = "llama3-70b-8192"
+TOTAL_PROMPT_BUDGET = 7168
+RESERVED_FOR_COMPLETION = 2048
+HISTORY_MESSAGES_TO_KEEP = 6 # Keep the last 6 messages (3 turns)
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    raise ValueError("Missing OPENROUTER_API_KEY in .env")
+def count_tokens(text: str) -> int:
+    """A simple approximation for token counting."""
+    return len(text) // 4 if isinstance(text, str) else 0
 
-LEGAL_PROMPT_TEMPLATE = """
-You are a highly knowledgeable and professional legal assistant specializing exclusively in constitutional law. Your task is to provide clear, concise, and accurate answers to legal questions within this domain, suitable for users without a legal background.
+def sanitize_for_json(text: str) -> str:
+    """Removes control characters that can break JSON."""
+    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
 
-When answering:
-- Answer questions shortly and clearly, focusing on constitutional principles.
-- Explicitly mention the source file, page number, and any constitutional articles cited in the context.
-- Cite specific constitutional articles or legal provisions whenever relevant.
-- Use formal yet accessible language; avoid unnecessary legal jargon, and explain terms simply when used.
-- Base your answers primarily on the provided context. If the context lacks relevant information, respond with well-informed general constitutional law principles.
-- Keep answers focused, structured, and clear, highlighting key points.
-- Do not provide legal advice or personal opinions; your role is to inform based on constitutional texts and principles.
-- If the question is vague or lacks sufficient context, ask for clarification or more details.
-- For questions about specific legal cases or situations, explain applicable constitutional principles without delving into case law or detailed legal interpretations.
-- For multi-part questions, break down your answer into clearly labeled sections addressing each part.
-- Always conclude with a concise summary reinforcing the key constitutional principles relevant to the question.
-- For questions about legal processes or procedures, clearly outline the constitutional steps involved.
-- When discussing rights or freedoms guaranteed by the constitution, explain them clearly and cite relevant articles along with their implications.
-- When discussing limitations or restrictions on rights, explain the constitutional basis, including any conditions or legal standards.
-- For questions about interpretation of constitutional provisions, provide a balanced explanation based on established legal principles, avoiding personal bias.
-- If the question is outside the scope of constitutional law, politely inform the user and suggest they consult a qualified legal professional for such inquiries.
+def generate_with_groq(
+    question: str,
+    retrieved_chunks: List[Dict[str, str]],
+    chat_history: List[Dict[str, str]] = [],
+    temp_chunks: Optional[List[str]] = None,
+) -> str:
+    """
+    Generates a response using Groq with a highly structured, behavior-driven
+    system prompt for maximum accuracy and strict source attribution.
+    """
+    if not GROQ_API_KEY:
+        return "❌ GROQ_API_KEY is not set. Please check your .env file."
 
+    # --- Behavior-Driven Prompt Engineering ---
+    system_message = """
+You are an AI Legal Assistant. Your primary goal is to provide accurate, source-based legal answers. You MUST strictly follow the rules below without exception:
 
-Examples:
+===============================
+💬 LANGUAGE MATCHING (CRITICAL)
+===============================
+- Always respond **in the exact same language** as the user's question.
+- If the user asks in Armenian(not about Armenia), respond **entirely in Armenian**.  
+- If the user asks in Russian, respond **entirely in Russian**.
+- Do **not** use the conversation context language.
+- You may use English words **within** the language if natural (e.g., legal terms, names).
 
-Q: What rights does the constitution guarantee regarding freedom of speech?
-A: The constitution guarantees citizens the right to freely express their opinions, subject to lawful restrictions for reasons such as national security, public order, and protection of others’ rights (Article 3). It also protects freedom of literary and artistic creation (Article 43).
+==================================
+📚 SOURCE PRIORITIZATION (CRITICAL)
+==================================
+When answering, always follow this strict priority order:
 
-Q: Can the government restrict freedom of assembly?
-A: Yes, the constitution allows restrictions on freedom of assembly, but only under conditions prescribed by law and for protecting state security, public order, or other fundamental rights (Article 44). Such restrictions must be lawful and proportionate.
+1. **User Uploaded Document ("Primary Context")**  
+   - This is your most trusted and highest priority source.
 
-Q: How does the constitution protect the right to a fair trial?
-A: The constitution guarantees the right to a fair trial, ensuring that every individual has the right to be heard by an impartial tribunal, to present evidence, and to receive a reasoned judgment (Article 45). It also provides for legal representation and the presumption of innocence until proven guilty.
+2. **Knowledge Base Document ("Secondary Context")**  
+   - Use only if the uploaded file does not contain the answer.
 
-Q: how are you?
-A: I am an AI legal assistant and do not have feelings, but I am here to help you with your constitutional law questions.
+3. **Your Own General Knowledge**  
+   - Use **only** if the answer is not available in either the uploaded file or knowledge base.
 
+====================================
+📌 SOURCE ATTRIBUTION (MANDATORY)
+====================================
+Always begin your response by clearly stating your source:
 
-Context:
-{context}
+- If using the uploaded file:  
+  ➤ **"Based on the uploaded document..."**
 
-Question:
-{question}
+- If using the knowledge base file:  
+  ➤ **"Based on the knowledge base document '[filename.pdf]'..."**  
+  (Be specific about the filename)
 
-Answer:
+- If using your own knowledge:  
+  ➤ **"The provided documents do not contain this information. Based on general legal principles..."**
+
+=========================================
+📂 CONVERSATION HISTORY (REFERENCE ONLY)
+=========================================
+- Use conversation history to understand follow-up questions like:  
+  ➤ "What was that again?" or "Tell me more."
+
+- You may answer questions about the history, e.g.:  
+  ➤ "What was the first question I asked?"
+
+DO NOT use history for sourcing legal answers unless it's reflected in uploaded or knowledge base content.
+
 """
 
-def generate_response(question, context_chunks, model="meta-llama/llama-3-8b-instruct", temperature=0.1, max_tokens=512):
-    context = "\n\n".join([f"{i+1}. {chunk}" for i, chunk in enumerate(context_chunks)]) or "No relevant legal context found."
-    prompt = LEGAL_PROMPT_TEMPLATE.format(question=question.strip(), context=context)
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You are a constitutional legal assistant."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens
-    }
+    # --- Efficient Chronological History ---
+    history_context = ""
+    if chat_history:
+        # Limit to the last N messages for recent context
+        recent_history = chat_history[-HISTORY_MESSAGES_TO_KEEP:]
+        history_context = "\n".join([f"{msg['role']}: {msg['content']}" for msg in recent_history])
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost",  # Required for OpenRouter's free tier
-        "X-Title": "AI Legal Assistant"
-    }
 
-    for attempt in range(3):
-        try:
-            logger.info(f"Calling OpenRouter (attempt {attempt+1})...")
-            response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"].strip()
-        except requests.RequestException as e:
-            logger.warning(f"Attempt {attempt+1} failed: {e}")
-            time.sleep(2 ** attempt)
+    # --- Token Budgeting ---
+    sanitized_question = sanitize_for_json(question)
+    sanitized_system_message = sanitize_for_json(system_message)
 
-    logger.error("All attempts to OpenRouter API failed.")
-    return "Sorry, the assistant could not generate a response at this time."
+    question_tokens = count_tokens(sanitized_question)
+    system_prompt_tokens = count_tokens(sanitized_system_message)
+    history_tokens = count_tokens(history_context)
+
+    remaining_budget = TOTAL_PROMPT_BUDGET - (question_tokens + system_prompt_tokens + history_tokens + RESERVED_FOR_COMPLETION)
+
+    # --- Build Contexts Following Priority ---
+    temp_context_str = ""
+    if temp_chunks:
+        temp_context_list = []
+        current_tokens = 0
+        # Give temporary files a larger portion of the budget
+        budget = remaining_budget * 0.6
+        for chunk in temp_chunks:
+            chunk_tokens = count_tokens(chunk)
+            if current_tokens + chunk_tokens <= budget:
+                # Note: Source is generic here as it's from a single session file
+                temp_context_list.append(f"Content: {chunk}")
+                current_tokens += chunk_tokens
+        temp_context_str = "\n\n".join(temp_context_list)
+
+    rag_context_str = ""
+    if retrieved_chunks:
+        rag_context_list = []
+        current_tokens = 0
+        # Use the remaining budget for permanent docs
+        budget = remaining_budget - count_tokens(temp_context_str)
+        for chunk_info in retrieved_chunks:
+            source = chunk_info.get("source", "Unknown Source")
+            text = chunk_info.get("text", "")
+            formatted_chunk = f"Source: {source}\nContent: {text}"
+            chunk_tokens = count_tokens(formatted_chunk)
+            if current_tokens + chunk_tokens <= budget:
+                rag_context_list.append(formatted_chunk)
+                current_tokens += chunk_tokens
+        rag_context_str = "\n\n".join(rag_context_list)
+
+    # --- Construct Final Prompt with Strict Ordering ---
+    final_context_str = ""
+    if history_context:
+        final_context_str += f"--- Recent Conversation History ---\n{history_context}\n\n"
+    # The order here is critical for the model to follow the priority rule.
+    if temp_context_str:
+        final_context_str += f"--- Primary Context (User Uploaded Document) ---\n{temp_context_str}\n\n"
+    if rag_context_str:
+        final_context_str += f"--- Secondary Context (Knowledge Base) ---\n{rag_context_str}\n"
+
+    if not final_context_str.strip():
+        final_context_str = "No relevant context found."
+
+    # --- API Call ---
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+
+        messages_to_send = [
+            {"role": "system", "content": sanitized_system_message},
+            {"role": "system", "content": f"CONTEXT STARTS HERE\n\n{final_context_str}\n\nCONTEXT ENDS HERE"}
+        ] + [{"role": "user", "content": sanitized_question}]
+
+        chat_completion = client.chat.completions.create(
+            messages=messages_to_send,
+            model=LLM_MODEL,
+            temperature=0.1,
+            max_tokens=RESERVED_FOR_COMPLETION,
+        )
+        answer = chat_completion.choices[0].message.content
+
+        return answer
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return f"An error occurred while generating the response: {e}"

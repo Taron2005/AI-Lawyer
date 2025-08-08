@@ -1,140 +1,89 @@
-import os
 import faiss
-import pickle
-import logging
 import numpy as np
-from datetime import datetime
-from typing import List, Dict, Tuple, Optional
 from sentence_transformers import SentenceTransformer
+from llm import generate_with_groq
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+# NOTE: The main application (`api_backend.py` and `main.py`) uses a separate,
+# more direct retrieval logic defined in the `rag_manager.py` file.
+# This `AdvancedRAG` class is a self-contained implementation and is not
+# currently used by the active API endpoints. The errors you are seeing
+# originate from the `llm.py` file when it processes the context.
 
+class AdvancedRAG:
+    def __init__(self, documents, metadatas=None, embedding_model="sentence-transformers/LaBSE"):
+        """
+        documents: List of strings (knowledge base chunks)
+        metadatas: List of dicts (metadata for each chunk, e.g., {"source": "doc1.pdf", "chunk_id": 0})
+        embedding_model: HuggingFace model name for sentence embeddings
+        """
+        if not documents or not isinstance(documents, list):
+            raise ValueError("Documents must be a non-empty list of strings.")
+        self.documents = documents
+        self.metadatas = metadatas if metadatas else [{} for _ in documents]
+        self.model = SentenceTransformer(embedding_model)
+        self.doc_embeddings = self.model.encode(documents, convert_to_numpy=True)
+        self.index = faiss.IndexFlatL2(self.doc_embeddings.shape[1])
+        self.index.add(self.doc_embeddings)
 
-class RAGEngine:
-    def __init__(
-        self,
-        index_path: str = "storage/faiss_index.bin",
-        metadata_path: str = "storage/index_metadata.pkl",
-        model_name: str = "all-MiniLM-L6-v2"
-    ):
-        self.index_path = index_path
-        self.metadata_path = metadata_path
-        self.model = SentenceTransformer(model_name)
-
-        self.index = self._load_faiss_index()
-        self.texts, self.metadatas = self._load_metadata()
-
-    def _load_faiss_index(self) -> faiss.Index:
-        if not os.path.exists(self.index_path):
-            logger.warning("FAISS index not found, creating a new one.")
-            return faiss.IndexFlatIP(self.model.get_sentence_embedding_dimension())
-        try:
-            return faiss.read_index(self.index_path)
-        except Exception as e:
-            logger.error(f"Failed to load FAISS index: {e}")
-            raise
-
-    def _load_metadata(self) -> Tuple[List[str], List[Dict]]:
-        if not os.path.exists(self.metadata_path):
-            logger.warning("Metadata file not found. Initializing empty metadata.")
-            return [], []
-        try:
-            with open(self.metadata_path, "rb") as f:
-                data = pickle.load(f)
-            return data.get("texts", []), data.get("metadatas", [])
-        except Exception as e:
-            logger.error(f"Failed to load metadata: {e}")
-            raise
-
-    def _normalize(self, vecs: np.ndarray) -> np.ndarray:
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        return vecs / np.maximum(norms, 1e-10)
-
-    def _encode(self, texts: List[str]) -> np.ndarray:
-        try:
-            with torch.no_grad():
-                embeddings = self.model.encode(texts, convert_to_numpy=True)
-        except Exception:
-            embeddings = self.model.encode(texts)
-        return self._normalize(np.array(embeddings, dtype=np.float32))
-
-    def retrieve(self, query: str, k: int = 5) -> List[Dict]:
-        if not query.strip():
-            raise ValueError("Query string is empty.")
-
-        embedding = self._encode([query])
-        D, I = self.index.search(embedding, k)
-
+    def retrieve(self, query, top_k=3, score_threshold=None, return_metadata=False):
+        """
+        Retrieve top_k most relevant documents for the query.
+        Optionally filter by score_threshold (lower = more similar).
+        Optionally return metadata.
+        """
+        if not query:
+            raise ValueError("Query must be a non-empty string.")
+        query_vec = self.model.encode([query], convert_to_numpy=True)
+        distances, indices = self.index.search(query_vec, top_k)
         results = []
-        for dist, idx in zip(D[0], I[0]):
-            if idx < len(self.texts):
-                results.append({
-                    "text": self.texts[idx],
-                    "metadata": self.metadatas[idx],
-                    "score": float(dist)
-                })
-        return results
+        for idx, dist in zip(indices[0], distances[0]):
+            if score_threshold is not None and dist > score_threshold:
+                continue
+            item = {"text": self.documents[idx], "score": dist}
+            if self.metadatas:
+                item["metadata"] = self.metadatas[idx]
+            results.append(item)
+        if return_metadata:
+            return results
+        return [item["text"] for item in results]
 
-    def add_to_index(self, file_name: str, file_chunks: List[str]) -> None:
-        if not file_chunks:
-            logger.warning("No file chunks provided.")
-            return
+    def batch_retrieve(self, queries, top_k=3):
+        """
+        Retrieve top_k docs for each query in a batch.
+        Returns a list of lists.
+        """
+        query_vecs = self.model.encode(queries, convert_to_numpy=True)
+        distances, indices = self.index.search(query_vecs, top_k)
+        batch_results = []
+        for idx_list in indices:
+            batch_results.append([self.documents[i] for i in idx_list])
+        return batch_results
 
-        new_chunks, new_metadatas = [], []
-        existing_text_set = set(self.texts)
+    def format_context(self, docs_or_items, include_metadata=True):
+        """
+        Format retrieved docs/items as context for the LLM.
+        If include_metadata, show metadata in the context.
+        """
+        formatted = []
+        for i, item in enumerate(docs_or_items):
+            if isinstance(item, dict):
+                meta = item.get("metadata", {})
+                meta_str = f" | Metadata: {meta}" if meta and include_metadata else ""
+                formatted.append(f"Context chunk {i+1}:{meta_str}\n{item['text']}")
+            else:
+                formatted.append(f"Context chunk {i+1}:\n{item}")
+        return "\n\n".join(formatted)
 
-        for chunk in file_chunks:
-            if chunk not in existing_text_set:
-                new_chunks.append(chunk)
-                new_metadatas.append({
-                    "source": file_name,
-                    "added_at": datetime.utcnow().isoformat()
-                })
+    def answer(self, question, top_k=5, model="llama3-70b-8192", score_threshold=None):
+        """
+        Retrieve context and generate an answer using the LLM.
+        This method now passes raw chunks to the LLM function for better
+        token management, aligning with the fixes made elsewhere.
+        """
+        # **FIX**: Retrieve raw text chunks instead of pre-formatted items.
+        # This allows the `generate_with_groq` function to handle token budgeting.
+        retrieved_chunks = self.retrieve(question, top_k=top_k, score_threshold=score_threshold)
+        
+        # Pass the list of chunks directly to the LLM function.
+        return generate_with_groq(question, retrieved_chunks=retrieved_chunks, model=model)
 
-        if not new_chunks:
-            logger.info("No new unique chunks to add.")
-            return
-
-        new_embeddings = self._encode(new_chunks)
-        self.index.add(new_embeddings)
-        self.texts.extend(new_chunks)
-        self.metadatas.extend(new_metadatas)
-
-        self._persist()
-        logger.info(f"Added {len(new_chunks)} new chunks from '{file_name}'.")
-
-    def delete_by_source(self, file_name: str) -> None:
-        logger.info(f"Deleting all entries from source: '{file_name}'")
-
-        kept_texts, kept_metadatas = [], []
-        for text, meta in zip(self.texts, self.metadatas):
-            if meta.get("source") != file_name:
-                kept_texts.append(text)
-                kept_metadatas.append(meta)
-
-        if len(kept_texts) == len(self.texts):
-            logger.warning("No entries found for deletion.")
-            return
-
-        self.texts, self.metadatas = kept_texts, kept_metadatas
-
-        if kept_texts:
-            embeddings = self._encode(kept_texts)
-            self.index = faiss.IndexFlatIP(self.model.get_sentence_embedding_dimension())
-            self.index.add(embeddings)
-        else:
-            self.index = faiss.IndexFlatIP(self.model.get_sentence_embedding_dimension())
-
-        self._persist()
-        logger.info(f"Deleted source '{file_name}'. Rebuilt index with {len(self.texts)} entries.")
-
-    def _persist(self) -> None:
-        try:
-            faiss.write_index(self.index, self.index_path)
-            with open(self.metadata_path, "wb") as f:
-                pickle.dump({"texts": self.texts, "metadatas": self.metadatas}, f)
-            logger.info("Index and metadata saved.")
-        except Exception as e:
-            logger.error(f"Failed to persist data: {e}")
-            raise

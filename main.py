@@ -1,84 +1,88 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from pydantic import BaseModel
-from rag import RAGEngine
-from llm import generate_response
-import fitz
-import logging
-from fastapi.responses import FileResponse
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from llm import generate_with_groq
 
+# NOTE: The main application (`api_backend.py` and `main.py`) uses a separate,
+# more direct retrieval logic defined in the `rag_manager.py` file.
+# This `AdvancedRAG` class is a self-contained implementation and is not
+# currently used by the active API endpoints. The errors you are seeing
+# originate from the `llm.py` file when it processes the context.
 
-app = FastAPI()
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+class AdvancedRAG:
+    def __init__(self, documents, metadatas=None, embedding_model="sentence-transformers/LaBSE"):
+        """
+        documents: List of strings (knowledge base chunks)
+        metadatas: List of dicts (metadata for each chunk, e.g., {"source": "doc1.pdf", "chunk_id": 0})
+        embedding_model: HuggingFace model name for sentence embeddings
+        """
+        if not documents or not isinstance(documents, list):
+            raise ValueError("Documents must be a non-empty list of strings.")
+        self.documents = documents
+        self.metadatas = metadatas if metadatas else [{} for _ in documents]
+        self.model = SentenceTransformer(embedding_model)
+        self.doc_embeddings = self.model.encode(documents, convert_to_numpy=True)
+        self.index = faiss.IndexFlatL2(self.doc_embeddings.shape[1])
+        self.index.add(self.doc_embeddings)
 
-rag = RAGEngine()
+    def retrieve(self, query, top_k=3, score_threshold=None, return_metadata=False):
+        """
+        Retrieve top_k most relevant documents for the query.
+        Optionally filter by score_threshold (lower = more similar).
+        Optionally return metadata.
+        """
+        if not query:
+            raise ValueError("Query must be a non-empty string.")
+        query_vec = self.model.encode([query], convert_to_numpy=True)
+        distances, indices = self.index.search(query_vec, top_k)
+        results = []
+        for idx, dist in zip(indices[0], distances[0]):
+            if score_threshold is not None and dist > score_threshold:
+                continue
+            item = {"text": self.documents[idx], "score": dist}
+            if self.metadatas:
+                item["metadata"] = self.metadatas[idx]
+            results.append(item)
+        if return_metadata:
+            return results
+        return [item["text"] for item in results]
 
-class QuestionRequest(BaseModel):
-    question: str
+    def batch_retrieve(self, queries, top_k=3):
+        """
+        Retrieve top_k docs for each query in a batch.
+        Returns a list of lists.
+        """
+        query_vecs = self.model.encode(queries, convert_to_numpy=True)
+        distances, indices = self.index.search(query_vecs, top_k)
+        batch_results = []
+        for idx_list in indices:
+            batch_results.append([self.documents[i] for i in idx_list])
+        return batch_results
 
-@app.post("/ask")
-async def ask(request: QuestionRequest):
-    if not request.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    def format_context(self, docs_or_items, include_metadata=True):
+        """
+        Format retrieved docs/items as context for the LLM.
+        If include_metadata, show metadata in the context.
+        """
+        formatted = []
+        for i, item in enumerate(docs_or_items):
+            if isinstance(item, dict):
+                meta = item.get("metadata", {})
+                meta_str = f" | Metadata: {meta}" if meta and include_metadata else ""
+                formatted.append(f"Context chunk {i+1}:{meta_str}\n{item['text']}")
+            else:
+                formatted.append(f"Context chunk {i+1}:\n{item}")
+        return "\n\n".join(formatted)
 
-    try:
-        retrieved = rag.retrieve(request.question.strip(), k=3)
-        context = [item["text"] for item in retrieved]
-        answer = generate_response(request.question.strip(), context)
+    def answer(self, question, top_k=5, model="llama3-70b-8192", score_threshold=None):
+        """
+        Retrieve context and generate an answer using the LLM.
+        This method now passes raw chunks to the LLM function for better
+        token management, aligning with the fixes made elsewhere.
+        """
+        # **FIX**: Retrieve raw text chunks instead of pre-formatted items.
+        # This allows the `generate_with_groq` function to handle token budgeting.
+        retrieved_chunks = self.retrieve(question, top_k=top_k, score_threshold=score_threshold)
         
-        # --- TTS: Convert answer to speech and save ---
-        tts_filename = "answer.wav"
-        foo(answer, filename=tts_filename)
-
-        return {
-            "answer": answer,
-            "audio_file": tts_filename,
-            "sources": [item["metadata"] for item in retrieved],
-            "snippets": context
-        }
-
-    except Exception as e:
-        logger.exception("RAG retrieval failed.")
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
-
-@app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
-
-    contents = await file.read()
-    if len(contents) < 100:
-        raise HTTPException(status_code=400, detail="File too small or empty.")
-
-    try:
-        doc = fitz.open(stream=contents, filetype="pdf")
-    except Exception as e:
-        logger.exception("Failed to open uploaded PDF.")
-        raise HTTPException(status_code=400, detail="Unable to process uploaded PDF.")
-
-    chunks = []
-    for page in doc:
-        try:
-            text = page.get_text("text")
-            for para in text.split('\n\n'):
-                if len(para.strip()) > 50:
-                    chunks.append(para.strip())
-        except Exception as e:
-            logger.warning(f"Page read failed: {e}")
-
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No readable content found.")
-
-    before = len(rag.texts)
-    rag.add_to_index(file.filename, chunks)
-    after = len(rag.texts)
-
-    return {
-        "message": f"{file.filename} indexed.",
-        "new_chunks": after - before,
-        "total_chunks": after
-    }
-
-@app.get("/audio")
-async def get_audio():
-    return FileResponse("answer.wav", media_type="audio/wav", filename="answer.wav")
+        # Pass the list of chunks directly to the LLM function.
+        return generate_with_groq(question, retrieved_chunks=retrieved_chunks, model=model)
